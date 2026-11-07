@@ -345,9 +345,15 @@ public:
             {
                 std::lock_guard<std::recursive_mutex> g(voiceLock);
                 if (slot < 0 || slot >= WB_MAXV || !used[slot]) break;
-                tag = flTag[slot]; used[slot] = false; flParams[slot] = nullptr;
+                tag = flTag[slot];
+                if (!cb.b) { used[slot] = false; flParams[slot] = nullptr; }
             }
-            host->Voice_Kill(tag, (BOOL)cb.b);
+            host->Voice_Kill(tag, (BOOL)cb.b);          // KillHandle: FL calls our Voice_Kill(slot) -> OP_VKILL
+            if (cb.b) {
+                bool still;
+                { std::lock_guard<std::recursive_mutex> g(voiceLock); still = used[slot]; }
+                if (still) Voice_Kill(slot + 1);         // FL did not: free the voice ourselves
+            }
             break;
         }
         case CB_VOICERELEASE:

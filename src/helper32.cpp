@@ -6,6 +6,7 @@
 
 static WBShared *S;
 static HANDLE evAudioReq, evAudioResp, parentProc;
+static bool traceVoices;   // WB_DEBUG set: log every voice event
 static volatile bool quitting = false;
 static DWORD guiThreadId;
 
@@ -107,10 +108,16 @@ public:
 
     void _stdcall Voice_Kill(intptr_t Sender, BOOL KillHandle) override {
         int slot = (int)Sender - 1;
-        if (slot >= 0 && slot < WB_MAXV) S->voices[slot].active = 0;   // finished: its handle may be reused any moment
+        // KillHandle: Wasp wants its Voice_Kill called for this handle (arrives as OP_VKILL through FL);
+        // without it the plugin has dropped the voice already and only our record needs clearing
+        if (!KillHandle && slot >= 0 && slot < WB_MAXV) S->voices[slot].active = 0;
+        if (traceVoices) HostLog("wasp: Voice_Kill slot %d killHandle %d", slot, (int)KillHandle);
         PushCb(CB_VOICEKILL, slot, KillHandle);
     }
-    void _stdcall Voice_Release(intptr_t Sender) override { PushCb(CB_VOICERELEASE, Sender - 1); }
+    void _stdcall Voice_Release(intptr_t Sender) override {
+        if (traceVoices) HostLog("wasp: Voice_Release slot %d", (int)Sender - 1);
+        PushCb(CB_VOICERELEASE, Sender - 1);
+    }
     int _stdcall Voice_ProcessEvent(intptr_t Sender, intptr_t EventID, intptr_t, intptr_t) override {
         int slot = (int)Sender - 1;
         float f;
@@ -270,15 +277,21 @@ static void Serve(WBChannel *ch, bool gui) {
             // that still points at it is dead now (else its release/kill would hit the new note, and
             // FL's voice list would fill up)
             for (int i = 0; i < WB_MAXV; i++)
-                if (i != slot && S->voices[i].active && S->voices[i].handle == (int32_t)h) { S->voices[i].active = 0; host.PushCb(CB_VOICEKILL, i, 1); }
+                if (i != slot && S->voices[i].active && S->voices[i].handle == (int32_t)h) {
+                    S->voices[i].active = 0; host.PushCb(CB_VOICEKILL, i, 1);
+                    if (traceVoices) HostLog("trigger slot %d: Wasp reused the voice of slot %d (handle %#x)", slot, i, (unsigned)h);
+                }
             S->voices[slot].handle = (int32_t)h; S->voices[slot].active = 1; r = 1;
+            if (traceVoices) HostLog("trigger slot %d -> handle %#x", slot, (unsigned)h);
         }
         break;
     }
     case OP_VRELEASE:
+        if (traceVoices) HostLog("fl: release slot %d (%s)", slot, slotOk && S->voices[slot].active ? "active" : "ignored");
         if (slotOk && S->voices[slot].active) { std::lock_guard<std::recursive_mutex> g(host.mix); p->Voice_Release(S->voices[slot].handle); }
         break;
     case OP_VKILL:
+        if (traceVoices) HostLog("fl: kill slot %d (%s)", slot, slotOk && S->voices[slot].active ? "active" : "ignored");
         if (slotOk && S->voices[slot].active) {
             std::lock_guard<std::recursive_mutex> g(host.mix);
             S->voices[slot].active = 0;
@@ -343,6 +356,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     if (!evAudioReq || !evAudioResp || !evReady || !parentProc) return 4;
 
     OleInitialize(nullptr);
+    traceVoices = GetEnvironmentVariableA("WB_DEBUG", nullptr, 0) > 0;
     guiThreadId = GetCurrentThreadId();
     if (!host.Load(dll.c_str())) { S->error = 1; SetEvent(evReady); return 5; }
     TFruityPlugInfo *in = host.plug->Info;

@@ -1,6 +1,6 @@
 ; ReWasp installer (Inno Setup 6). Built by ..\build.bat.
 ; The work itself is done by rewasp.ps1, so the same logic can be run by hand.
-#define AppVersion "1.0.3"
+#define AppVersion "1.0.4"
 
 [Setup]
 AppId={{6B0C5F0E-4E8A-4C35-9F5B-2A1D7F3C9E51}
