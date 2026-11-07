@@ -178,7 +178,13 @@ function ReadLog: String;
 var
   Lines: AnsiString;
 begin
-  if LoadStringFromFile(ExpandConstant('{app}\rewasp.log'), Lines) then Result := String(Lines) else Result := '';
+  Result := '';
+  if LoadStringFromFile(ExpandConstant('{app}\rewasp.log'), Lines) then
+  begin
+    // PowerShell writes the log as UTF-8 with a byte-order mark; drop the mark
+    if (Length(Lines) >= 3) and (Lines[1] = #$EF) and (Lines[2] = #$BB) and (Lines[3] = #$BF) then Delete(Lines, 1, 3);
+    Result := String(Lines);
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -196,6 +202,7 @@ begin
     if Code = 2 then
       if MsgBox('FL Studio is running. Close it, then click Retry.', mbError, MB_RETRYCANCEL) = IDCANCEL then Break;
   until Code <> 2;
+  if WizardSilent then Exit;   // the log says what happened
   if Code = 0 then
     MsgBox(ReadLog, mbInformation, MB_OK)
   else
