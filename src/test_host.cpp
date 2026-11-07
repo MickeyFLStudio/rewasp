@@ -1,8 +1,29 @@
 // Offline test: load a Fruity generator, play a note, write out.wav, report level & pitch.
 // usage: test_host.exe <plugin.dll> [note] [out.wav] [state.bin]
 #include "flhost.h"
+#include <tlhelp32.h>
 #include <stdlib.h>
 #include <algorithm>
+
+// WB_TEST_KILL=1: after the first note, kill the bridge's helper process and check that the bridge
+// brings it back by itself (the hostWnd timer needs this thread's message queue pumped, like FL does)
+static DWORD FindHelper() {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W e = { sizeof(e) }; DWORD found = 0;
+    if (Process32FirstW(snap, &e)) do {
+        if (e.th32ParentProcessID == GetCurrentProcessId() && !_wcsicmp(e.szExeFile, L"WaspHost32.exe")) found = e.th32ProcessID;
+    } while (Process32NextW(snap, &e));
+    CloseHandle(snap);
+    return found;
+}
+static void Pump(DWORD ms) {
+    DWORD until = GetTickCount() + ms;
+    while ((int)(until - GetTickCount()) > 0) {
+        MSG m;
+        while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
+        Sleep(20);
+    }
+}
 
 static void WriteWav(const char *path, const std::vector<float> &s, int sr) {
     FILE *f; fopen_s(&f, path, "wb"); if (!f) return;
@@ -67,6 +88,37 @@ int wmain(int argc, wchar_t **argv) {
     tailRms = sqrt(tailRms / (sr / 2));
     printf("note %d: peak=%.3f rms=%.4f approx freq=%.1f Hz (expect %.1f)  tail rms=%.5f  voices left=%s\n",
            note, peak, rms, cross / ((onEnd - onStart) / 2.0 / sr - 0.5), 440 * pow(2, (note - 69) / 12.0), tailRms, "?");
+    wchar_t mode[16] = L"";
+    if (GetEnvironmentVariableW(L"WB_TEST_KILL", mode, 16)) {   // "1" = kill, "hang" = freeze every helper thread
+        Pump(2500);               // let the bridge take a snapshot of the patch first
+        host.plug->ProcessParam(0, 777, REC_UpdateValue);   // a tweak the restored helper must still show
+        Pump(2500);
+        int before = host.plug->ProcessParam(0, 0, REC_GetValue);
+        DWORD pid = FindHelper();
+        if (!pid) printf("helper process not found\n");
+        else if (!wcscmp(mode, L"hang")) {
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            THREADENTRY32 t = { sizeof(t) }; int n = 0;
+            if (Thread32First(snap, &t)) do {
+                if (t.th32OwnerProcessID == pid) if (HANDLE th = OpenThread(THREAD_SUSPEND_RESUME, FALSE, t.th32ThreadID)) { SuspendThread(th); CloseHandle(th); n++; }
+            } while (Thread32Next(snap, &t));
+            CloseHandle(snap);
+            printf("froze the helper (pid %lu, %d threads)\n", pid, n);
+        } else {
+            HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+            if (h) { TerminateProcess(h, 1); CloseHandle(h); printf("killed the helper (pid %lu)\n", pid); }
+        }
+        Pump(300);
+        run(0.3);                 // renders hit the dead helper: the bridge notices
+        Pump(8000);               // GUI-thread ticks: the bridge restarts it (a frozen helper is noticed after 5 s)
+        size_t s2 = all.size();
+        host.NoteOn(note, 0.8f); run(1.0); host.NoteOff(note); run(0.3);
+        double peak2 = 0;
+        for (size_t i = s2; i < all.size(); i++) peak2 = std::max(peak2, (double)fabs(all[i]));
+        int after = host.plug->ProcessParam(0, 0, REC_GetValue);
+        printf("after losing the helper: peak=%.3f, param 0 was %d now %d -> %s\n", peak2, before, after,
+               peak2 > 0.01 && after == before ? "RECOVERED" : "FAILED");
+    }
     WriteWav(out, all, sr);
     printf("wrote %s\n", out);
     host.Unload();

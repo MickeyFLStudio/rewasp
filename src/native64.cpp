@@ -10,6 +10,8 @@
 #include <vector>
 #include <mutex>
 #include <algorithm>
+#include <atomic>
+#include <map>
 #include "../sdk/fp_plugclass.h"
 #include "ipc.h"
 
@@ -40,7 +42,18 @@ public:
     HWND helperWnd = nullptr;
     HWND hostWnd = nullptr;   // receives WM_WB_HOST from the helper, on FL's GUI thread
     HANDLE helper = nullptr;
-    bool broken = true;
+    std::atomic<bool> broken{true};
+    // self-healing (see Tick/Restart): what a fresh helper needs to continue where the old one stopped
+    std::wstring dllPath, exePath;
+    volatile bool pendingRestart = false;
+    DWORD lostAt = 0, restartWindow = 0, lastSnapshot = 0;
+    int restarts = 0;
+    std::mutex stateLock;
+    std::vector<uint8_t> lastState;                      // the patch: FL's last load/save, refreshed every 2 s
+    std::map<std::pair<int, int>, intptr_t> settings;    // (FPD id, index) -> value of the host settings FL sent
+    std::map<int, std::pair<int, int>> events;           // ProcessEvent id -> (value, flags): tempo, poly, pan...
+    TTimeSigInfo timeSig = {}; bool haveTimeSig = false;
+    intptr_t editorParent = 0;                           // FPD_ShowEditor's parent while the editor is open
     std::recursive_mutex audioLock, voiceLock;
     volatile DWORD guiThread;
     // voice slots: FL's params pointer + FL's tag for each active voice
@@ -57,22 +70,22 @@ public:
         info.ShortName = shortName;
         info.Flags = 0x400011;
         info.NumParams = 0;
+        Locate();
+        CreateHostWindow();
         Start();
     }
 
     ~Bridge64() {
         if (S && !broken) Call(true, OP_DESTROY);
-        if (helper) { if (WaitForSingleObject(helper, 3000) != WAIT_OBJECT_0) TerminateProcess(helper, 0); CloseHandle(helper); }
-        for (HANDLE x : { evAudioReq, evAudioResp }) if (x) CloseHandle(x);
-        if (hostWnd) DestroyWindow(hostWnd);
-        if (S) UnmapViewOfFile(S);
-        if (map) CloseHandle(map);
+        Stop(3000);
+        if (hostWnd) { KillTimer(hostWnd, 1); DestroyWindow(hostWnd); }
     }
 
     // helper -> FL: runs a host dispatcher call the plugin needs answered synchronously
     static LRESULT CALLBACK HostWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-        if (m != WM_WB_HOST && m != WM_WB_PARAM && m != WM_WB_CTRL) return DefWindowProcW(h, m, w, l);
         Bridge64 *self = (Bridge64 *)GetWindowLongPtrW(h, GWLP_USERDATA);
+        if (m == WM_TIMER) { if (self) self->Tick(); return 0; }
+        if (m != WM_WB_HOST && m != WM_WB_PARAM && m != WM_WB_CTRL) return DefWindowProcW(h, m, w, l);
         if (!self || !self->S || self->broken) return 0;
         // knob moves arrive the moment they happen (not on the next Idle), so live automation recording keeps its timing
         if (m == WM_WB_PARAM) { self->host->OnParamChanged(self->HostTag, (int)w, (int)l); return 1; }
@@ -109,10 +122,88 @@ public:
             cls = RegisterClassW(&wc);
         }
         hostWnd = CreateWindowExW(0, L"WaspBridgeHost", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, g_self, nullptr);
-        if (hostWnd) SetWindowLongPtrW(hostWnd, GWLP_USERDATA, (LONG_PTR)this);
+        if (hostWnd) { SetWindowLongPtrW(hostWnd, GWLP_USERDATA, (LONG_PTR)this); SetTimer(hostWnd, 1, 1000, nullptr); }
     }
 
-    void Start() {
+    // ---- self-healing --------------------------------------------------------------------------
+    // If the helper dies or stops answering, Call() marks the bridge broken and the timer on hostWnd
+    // (FL's GUI thread, so it also works with the editor closed) starts a new helper and brings it back
+    // to where the old one was: the host settings FL had sent, the channel events, the last snapshot
+    // of the patch, and the editor. Voices FL still thinks are playing are reported dead.
+    void Lost() {
+        broken = true;
+        lostAt = GetTickCount();
+        pendingRestart = true;
+    }
+
+    void Stop(DWORD wait) {
+        broken = true;
+        if (helper) { if (WaitForSingleObject(helper, wait) != WAIT_OBJECT_0) TerminateProcess(helper, 0); CloseHandle(helper); helper = nullptr; }
+        for (HANDLE *x : { &evAudioReq, &evAudioResp }) if (*x) { CloseHandle(*x); *x = nullptr; }
+        if (S) { UnmapViewOfFile(S); S = nullptr; }
+        if (map) { CloseHandle(map); map = nullptr; }
+        helperWnd = nullptr;
+    }
+
+    void Remember(intptr_t ID, intptr_t Index, intptr_t Value) {
+        std::lock_guard<std::mutex> g(stateLock);
+        switch (ID) {
+        case FPD_ShowEditor: editorParent = Value; break;
+        case FPD_SetTimeSig: if (Value) { timeSig = *(TTimeSigInfo *)Value; haveTimeSig = true; } break;
+        case FPD_ProcessMode: case FPD_SetBlockSize: case FPD_SetSampleRate: case FPD_UseVoiceLevels: case FPD_SetEnabled:
+        case FPD_SetPlaying: case FPD_SetInternalParam: case FPD_SetNumSends: case FPD_SetFitTime: case FPD_SetSamplesPerTick:
+        case FPD_SetIdleTime: case FPD_SetIOLatency: case FPD_PreferredNumIO:
+            settings[{ (int)ID, (int)Index }] = Value; break;
+        }
+    }
+
+    void Tick() {
+        if (pendingRestart) { Restart(); return; }
+        if (broken) return;
+        DWORD now = GetTickCount();
+        if (now - lastSnapshot < 2000) return;
+        lastSnapshot = now;
+        std::vector<uint8_t> data;
+        Call(true, OP_SAVE, 0, 0, 0, 0, nullptr, 0, &data);
+        if (!data.empty() && !broken) { std::lock_guard<std::mutex> g(stateLock); lastState.swap(data); }
+    }
+
+    void Restart() {
+        DWORD now = GetTickCount();
+        if (now - lostAt < 1000) return;                                   // let the failure settle first
+        std::unique_lock<std::recursive_mutex> a(audioLock, std::try_to_lock);
+        if (!a.owns_lock()) return;                                        // a render still waits on the old helper: next tick
+        pendingRestart = false;
+        if (now - restartWindow > 60000) { restartWindow = now; restarts = 0; }
+        if (++restarts > 3) { Log("the helper keeps failing: giving up (reload the channel to try again)"); return; }
+        Log("restarting the helper (%d/3)", restarts);
+        Stop(0);
+        std::vector<intptr_t> dead;
+        {
+            std::lock_guard<std::recursive_mutex> g(voiceLock);
+            for (int i = 0; i < WB_MAXV; i++) if (used[i]) { dead.push_back(flTag[i]); used[i] = false; flParams[i] = nullptr; }
+        }
+        for (intptr_t t : dead) host->Voice_Kill(t, TRUE);
+        Start();
+        if (broken) { lostAt = GetTickCount(); pendingRestart = true; return; }   // counted; tried again in a second
+        std::map<std::pair<int, int>, intptr_t> st; std::map<int, std::pair<int, int>> ev; std::vector<uint8_t> state;
+        TTimeSigInfo ts; bool hts; intptr_t parent;
+        {
+            std::lock_guard<std::mutex> g(stateLock);
+            st = settings; ev = events; state = lastState; ts = timeSig; hts = haveTimeSig; parent = editorParent;
+        }
+        auto late = [](int id) { return id == FPD_SetEnabled || id == FPD_SetPlaying; };
+        for (auto &s : st) if (!late(s.first.first)) Call(true, OP_DISPATCHER, s.first.first, s.first.second, s.second);
+        if (hts) Call(true, OP_DISPATCHER, FPD_SetTimeSig, 0, 0, 0, &ts, sizeof(ts));
+        for (auto &e : ev) Call(true, OP_PROCESSEVENT, e.first, e.second.first, e.second.second);
+        if (!state.empty()) Call(true, OP_LOAD, 0, 0, 0, 0, state.data(), (int)state.size());
+        for (auto &s : st) if (late(s.first.first)) Call(true, OP_DISPATCHER, s.first.first, s.first.second, s.second);
+        DrainQueue();
+        if (parent) Call(true, OP_DISPATCHER, FPD_ShowEditor, 0, parent);
+        Log(broken ? "restart failed" : "helper restarted, %d state bytes restored", (int)state.size());
+    }
+
+    void Locate() {
         wchar_t me[MAX_PATH]; GetModuleFileNameW(g_self, me, MAX_PATH);
         std::wstring dir = Dir(me), file = std::wstring(me).substr(dir.size());
         std::wstring name = file.substr(0, file.rfind(L"_x64"));   // "Wasp" or "Wasp XT"
@@ -129,8 +220,13 @@ public:
             cands.push_back(std::wstring(L"C:\\Program Files\\Image-Line\\") + v + L"\\Plugins\\Fruity\\Generators\\" + name + L"\\" + name + L".dll");
         for (auto &c : cands) if (Exists(c)) { dll = c; break; }
         for (auto &c : { dir + L"x86\\WaspHost32.exe", dir + L"WaspHost32.exe" }) if (Exists(c)) { exe = c; break; }
-        if (dll.empty() || exe.empty()) { Log("missing: dll='%ls' helper='%ls'", dll.c_str(), exe.c_str()); return; }
+        if (dll.empty() || exe.empty()) Log("missing: dll='%ls' helper='%ls'", dll.c_str(), exe.c_str());
+        dllPath = dll; exePath = exe;
+    }
 
+    void Start() {
+        const std::wstring &dll = dllPath, &exe = exePath;
+        if (dll.empty() || exe.empty()) return;
         static LONG counter = 0;
         wchar_t id[64]; swprintf_s(id, L"%lu.%ld.%llu", GetCurrentProcessId(), InterlockedIncrement(&counter), (unsigned long long)GetTickCount64());
         auto nm = [&](const wchar_t *s) { return std::wstring(L"Local\\WaspBridge.") + id + s; };
@@ -139,7 +235,6 @@ public:
         S = (WBShared *)MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(WBShared));
         memset(S, 0, sizeof(WBShared));
         S->magic = WB_MAGIC;
-        CreateHostWindow();
         S->hostHwnd = (int64_t)(intptr_t)hostWnd;
         evAudioReq = CreateEventW(nullptr, FALSE, FALSE, nm(L".audioReq").c_str());
         evAudioResp = CreateEventW(nullptr, FALSE, FALSE, nm(L".audioResp").c_str());
@@ -203,12 +298,12 @@ public:
             fill(ch);
             MemoryBarrier();
             DWORD_PTR res = 0;
-            if (!SendMessageTimeoutW(helperWnd, WM_WB_CALL, f, 0, SMTO_NORMAL, 30000, &res)) {
+            if (!SendMessageTimeoutW(helperWnd, WM_WB_CALL, f, 0, SMTO_NORMAL, 10000, &res)) {
                 DWORD err = GetLastError();
                 bool dead = WaitForSingleObject(helper, 0) == WAIT_OBJECT_0;
                 Log("GUI request op %d failed (%s, err %lu)", op, dead ? "helper died" : "timeout", err);
                 S->guiBusy[f] = 0;
-                broken = true;
+                Lost();
                 return 0;
             }
             collect(ch);
@@ -224,11 +319,11 @@ public:
             SetEvent(evAudioReq);
             HANDLE w[2] = { evAudioResp, helper };
             while (ch->resp != seq) {
-                DWORD r = WaitForMultipleObjects(2, w, FALSE, 15000);
+                DWORD r = WaitForMultipleObjects(2, w, FALSE, 5000);
                 if (ch->resp == seq) break;
-                if (r == WAIT_OBJECT_0 + 1 || r == WAIT_TIMEOUT) {
-                    Log("audio request op %d failed (%s)", op, r == WAIT_TIMEOUT ? "timeout" : "helper died");
-                    broken = true;
+                if (r != WAIT_OBJECT_0) {
+                    Log("audio request op %d failed (%s)", op, r == WAIT_TIMEOUT ? "timeout" : r == WAIT_OBJECT_0 + 1 ? "helper died" : "wait failed");
+                    Lost();
                     return 0;
                 }
             }
@@ -272,6 +367,7 @@ public:
 
     // ---- TFruityPlug ----
     intptr_t _stdcall Dispatcher(intptr_t ID, intptr_t Index, intptr_t Value) override {
+        Remember(ID, Index, Value);
         switch (ID) {
         case FPD_ShowEditor:
             guiThread = GetCurrentThreadId();
@@ -300,6 +396,7 @@ public:
         if (Save) {
             std::vector<uint8_t> data;
             Call(true, OP_SAVE, 0, 0, 0, 0, nullptr, 0, &data);
+            if (!data.empty()) { std::lock_guard<std::mutex> g(stateLock); lastState = data; }
             ULONG w;
             if (!data.empty()) Stream->Write(data.data(), (ULONG)data.size(), &w);
         } else {
@@ -311,6 +408,7 @@ public:
                 data.insert(data.end(), buf, buf + got);
                 if (data.size() >= WB_DATA) break;
             }
+            { std::lock_guard<std::mutex> g(stateLock); lastState = data; }
             Call(true, OP_LOAD, 0, 0, 0, 0, data.data(), (int)data.size());
             DrainQueue();
         }
@@ -324,6 +422,7 @@ public:
         Name[255] = 0;
     }
     int _stdcall ProcessEvent(int EventID, int EventValue, int Flags) override {
+        if (EventID >= 0 && EventID < 16) { std::lock_guard<std::mutex> g(stateLock); events[EventID] = { EventValue, Flags }; }
         return (int)Call(OnGuiThread(), OP_PROCESSEVENT, EventID, EventValue, Flags);
     }
     int _stdcall ProcessParam(int Index, int Value, int RECFlags) override {

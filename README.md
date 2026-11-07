@@ -52,6 +52,8 @@ For every Wasp channel it starts a `WaspHost32.exe`, which loads the real 32-bit
 and plays the role of FL Studio for it. Notes, knob moves, automation, audio, saving and
 the editor window are passed across in both directions; Wasp's window sits inside FL's
 plugin window. You'll see one `WaspHost32.exe` per Wasp in Task Manager: that's normal.
+If a helper ever dies or stops answering, the plugin starts a new one by itself within a
+second or two and puts the patch, settings and window back; a channel is never left dead.
 
 The installer:
 

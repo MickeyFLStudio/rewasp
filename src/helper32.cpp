@@ -367,5 +367,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     SetEvent(evAudioReq);
     WaitForSingleObject(at, 2000);
     if (host.plug) host.Unload();
+    // Wasp.dll faults in its own shutdown code when the process ends normally (every closed Wasp
+    // channel left a crash report behind); nothing of ours is left to run, so end without it
+    TerminateProcess(GetCurrentProcess(), 0);
     return 0;
 }
