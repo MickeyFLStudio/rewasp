@@ -178,7 +178,9 @@ void FLHost::NoteOn(int note, float velocity) {
     nv.handle = plug->TriggerVoice(OldParams() ? (PVoiceParams)&nv.oldParams : &nv.params, nv.tag);
     if (nv.handle == FVH_Null) voices.pop_back();
     // safety: drop released voices the plugin never reported as finished
-    while (voices.size() > 64) { Voice &old = voices.front(); TVoiceHandle h = old.handle; voices.pop_front(); plug->Voice_Kill(h); }
+    // (FL Studio itself does not do this; the test host skips it too when WB_TEST_NOTES is set)
+    static const size_t limit = GetEnvironmentVariableA("WB_TEST_NOTES", nullptr, 0) ? 100000 : 64;
+    while (voices.size() > limit) { Voice &old = voices.front(); TVoiceHandle h = old.handle; voices.pop_front(); plug->Voice_Kill(h); }
 }
 
 void FLHost::NoteOff(int note) {

@@ -2,6 +2,9 @@
 // usage: test_host.exe <plugin.dll> [note] [out.wav] [state.bin]
 #include "flhost.h"
 #include <tlhelp32.h>
+#include <shlwapi.h>
+#include "ipc.h"
+#pragma comment(lib, "shlwapi.lib")
 #include <stdlib.h>
 #include <algorithm>
 
@@ -88,6 +91,21 @@ int wmain(int argc, wchar_t **argv) {
     tailRms = sqrt(tailRms / (sr / 2));
     printf("note %d: peak=%.3f rms=%.4f approx freq=%.1f Hz (expect %.1f)  tail rms=%.5f  voices left=%s\n",
            note, peak, rms, cross / ((onEnd - onStart) / 2.0 / sr - 0.5), 440 * pow(2, (note - 69) / 12.0), tailRms, "?");
+    if (GetEnvironmentVariableW(L"WB_TEST_NOTES", nullptr, 0)) {   // 300 short notes: more than the bridge has slots
+        // held, overlapping notes: far more than Wasp's 4 voices, so it has to steal voices
+        for (int i = 0; i < 300; i++) { host.NoteOn(48 + i % 24, 0.8f); run(0.02); }
+        host.AllNotesOff(); run(1.0);
+        size_t s3 = all.size();
+        host.NoteOn(note, 0.8f); run(0.5); host.NoteOff(note); run(0.3);
+        double peak3 = 0;
+        for (size_t i = s3; i < all.size(); i++) peak3 = std::max(peak3, (double)fabs(all[i]));
+        int slots = -1;
+        wchar_t base[MAX_PATH]; wcscpy_s(base, argv[1]); PathStripPathW(base);
+        if (HMODULE hm = GetModuleHandleW(base))
+            if (auto f = (int(_stdcall *)())GetProcAddress(hm, "WBDebug_UsedSlots")) slots = f();
+        printf("after 300 held notes: voice slots still held=%d (of %d), test note peak=%.3f -> %s\n", slots, WB_MAXV, peak3,
+               slots < 0 ? "no slot info in this build" : slots <= 8 && peak3 > 0.01 ? "OK" : "LEAK");
+    }
     wchar_t mode[16] = L"";
     if (GetEnvironmentVariableW(L"WB_TEST_KILL", mode, 16)) {   // "1" = kill, "hang" = freeze every helper thread
         Pump(2500);               // let the bridge take a snapshot of the patch first

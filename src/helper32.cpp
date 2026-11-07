@@ -105,7 +105,11 @@ public:
         return r;
     }
 
-    void _stdcall Voice_Kill(intptr_t Sender, BOOL KillHandle) override { PushCb(CB_VOICEKILL, Sender - 1, KillHandle); }
+    void _stdcall Voice_Kill(intptr_t Sender, BOOL KillHandle) override {
+        int slot = (int)Sender - 1;
+        if (slot >= 0 && slot < WB_MAXV) S->voices[slot].active = 0;   // finished: its handle may be reused any moment
+        PushCb(CB_VOICEKILL, slot, KillHandle);
+    }
     void _stdcall Voice_Release(intptr_t Sender) override { PushCb(CB_VOICERELEASE, Sender - 1); }
     int _stdcall Voice_ProcessEvent(intptr_t Sender, intptr_t EventID, intptr_t, intptr_t) override {
         int slot = (int)Sender - 1;
@@ -261,7 +265,14 @@ static void Serve(WBChannel *ch, bool gui) {
         if (!slotOk) break;
         std::lock_guard<std::recursive_mutex> g(host.mix);
         TVoiceHandle h = p->TriggerVoice((PVoiceParams)S->voices[slot].params, slot + 1);
-        if (h != FVH_Null) { S->voices[slot].handle = (int32_t)h; S->voices[slot].active = 1; r = 1; }
+        if (h != FVH_Null) {
+            // Wasp has a few voice objects and reuses one for a new note without saying so: the slot
+            // that still points at it is dead now (else its release/kill would hit the new note, and
+            // FL's voice list would fill up)
+            for (int i = 0; i < WB_MAXV; i++)
+                if (i != slot && S->voices[i].active && S->voices[i].handle == (int32_t)h) { S->voices[i].active = 0; host.PushCb(CB_VOICEKILL, i, 1); }
+            S->voices[slot].handle = (int32_t)h; S->voices[slot].active = 1; r = 1;
+        }
         break;
     }
     case OP_VRELEASE:

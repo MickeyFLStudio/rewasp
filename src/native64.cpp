@@ -60,6 +60,7 @@ public:
     PVoiceParams flParams[WB_MAXV] = {};
     intptr_t flTag[WB_MAXV] = {};
     bool used[WB_MAXV] = {};
+    uint32_t serial[WB_MAXV] = {}, nextSerial = 0;   // trigger order, to steal the oldest when all slots are taken
 
     Bridge64(TFruityPlugHost *h, TPluginTag tag) : host(h) {
         HostTag = tag;
@@ -337,9 +338,18 @@ public:
     void Replay(const WBCallback &cb) {
         int slot = (int)cb.a;
         switch (cb.type) {
-        case CB_VOICEKILL:
-            if (slot >= 0 && slot < WB_MAXV && used[slot]) host->Voice_Kill(flTag[slot], (BOOL)cb.b);
+        case CB_VOICEKILL: {
+            // the plugin says this voice is finished: free our slot first (FL may or may not call our
+            // Voice_Kill back, depending on KillHandle), then tell FL
+            intptr_t tag;
+            {
+                std::lock_guard<std::recursive_mutex> g(voiceLock);
+                if (slot < 0 || slot >= WB_MAXV || !used[slot]) break;
+                tag = flTag[slot]; used[slot] = false; flParams[slot] = nullptr;
+            }
+            host->Voice_Kill(tag, (BOOL)cb.b);
             break;
+        }
         case CB_VOICERELEASE:
             if (slot >= 0 && slot < WB_MAXV && used[slot]) host->Voice_Release(flTag[slot]);
             break;
@@ -447,12 +457,22 @@ public:
     TVoiceHandle _stdcall TriggerVoice(PVoiceParams VoiceParams, intptr_t SetTag) override {
         if (broken) return FVH_Null;
         int slot = -1;
-        {
-            std::lock_guard<std::recursive_mutex> g(voiceLock);
-            for (int i = 0; i < WB_MAXV; i++) if (!used[i]) { slot = i; break; }
-            if (slot < 0) return FVH_Null;
-            used[slot] = true; flParams[slot] = VoiceParams; flTag[slot] = SetTag;
-            memcpy(S->voices[slot].params, VoiceParams, 40);
+        for (int attempt = 0; attempt < 2 && slot < 0; attempt++) {
+            intptr_t oldest = 0;
+            {
+                std::lock_guard<std::recursive_mutex> g(voiceLock);
+                for (int i = 0; i < WB_MAXV; i++) if (!used[i]) { slot = i; break; }
+                if (slot >= 0) {
+                    used[slot] = true; flParams[slot] = VoiceParams; flTag[slot] = SetTag; serial[slot] = ++nextSerial;
+                    memcpy(S->voices[slot].params, VoiceParams, 40);
+                    break;
+                }
+                int o = 0;
+                for (int i = 1; i < WB_MAXV; i++) if ((int32_t)(serial[i] - serial[o]) < 0) o = i;
+                oldest = flTag[o];
+            }
+            if (attempt) return FVH_Null;
+            host->Voice_Kill(oldest, TRUE);   // all slots taken: FL kills its oldest voice (calls our Voice_Kill), freeing one
         }
         if (!Call(OnGuiThread(), OP_TRIGGER, slot)) { std::lock_guard<std::recursive_mutex> g(voiceLock); used[slot] = false; return FVH_Null; }
         return slot + 1;
@@ -486,8 +506,16 @@ TFruityPlug::TFruityPlug() : HostTag(0), Info(nullptr), EditorHandle(0), MonoRen
 TFruityPlug::~TFruityPlug() {}
 void _stdcall TFruityPlug::DestroyObject() { delete this; }
 
+static Bridge64 *g_last;   // for the test host's diagnostics only
 extern "C" __declspec(dllexport) TFruityPlug *_stdcall CreatePlugInstance(TFruityPlugHost *Host, TPluginTag Tag) {
-    return new Bridge64(Host, Tag);
+    return g_last = new Bridge64(Host, Tag);
+}
+// test host: how many voice slots the last instance holds (FL thinks these voices are still playing)
+extern "C" __declspec(dllexport) int _stdcall WBDebug_UsedSlots() {
+    if (!g_last) return -1;
+    int n = 0;
+    for (int i = 0; i < WB_MAXV; i++) if (g_last->used[i]) n++;
+    return n;
 }
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) {
