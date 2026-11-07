@@ -16,7 +16,7 @@ ReWasp fixes that. Install it once and:
 
 ## Install
 
-1. Download **ReWasp-Setup.exe** from [Releases](https://github.com/mickeyperry/rewasp/releases).
+1. Download **ReWasp-Setup.exe** from [Releases](https://github.com/MickeyFLStudio/rewasp/releases).
 2. Close FL Studio and run it.
 
 That's it. The installer finds your FL Studio versions by itself.
